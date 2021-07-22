@@ -23,11 +23,15 @@ type Config struct {
 
 type Extractor struct {
 	logger plugins.Logger
+	client *bigquery.Client
+	ctx    context.Context
 }
 
-func New(logger plugins.Logger) extractor.TableExtractor {
+func New(logger plugins.Logger, client *bigquery.Client, ctx context.Context) extractor.TableExtractor {
 	return &Extractor{
 		logger: logger,
+		client: client,
+		ctx:    ctx,
 	}
 }
 
@@ -43,12 +47,17 @@ func (e *Extractor) Extract(configMap map[string]interface{}) (result []meta.Tab
 		return
 	}
 
-	ctx := context.Background()
-	client, err := e.createClient(ctx, config)
-	if err != nil {
-		return
+	if e.ctx != nil {
+		e.ctx = context.Background()
 	}
-	result, err = e.getMetadata(ctx, client)
+
+	if e.client != nil {
+		e.client, err = e.createClient(config)
+		if err != nil {
+			return
+		}
+	}
+	result, err = e.getMetadata()
 	if err != nil {
 		return
 	}
@@ -56,12 +65,12 @@ func (e *Extractor) Extract(configMap map[string]interface{}) (result []meta.Tab
 	return
 }
 
-func (e *Extractor) getMetadata(ctx context.Context, client *bigquery.Client) (results []meta.Table, err error) {
-	it := client.Datasets(ctx)
+func (e *Extractor) getMetadata() (results []meta.Table, err error) {
+	it := e.client.Datasets(e.ctx)
 
 	dataset, err := it.Next()
 	for err == nil {
-		results, err = e.appendTablesMetadata(ctx, results, dataset, client)
+		results, err = e.appendTablesMetadata(results, dataset)
 		if err != nil {
 			return
 		}
@@ -77,12 +86,12 @@ func (e *Extractor) getMetadata(ctx context.Context, client *bigquery.Client) (r
 	return
 }
 
-func (e *Extractor) appendTablesMetadata(ctx context.Context, results []meta.Table, dataset *bigquery.Dataset, client *bigquery.Client) ([]meta.Table, error) {
-	it := dataset.Tables(ctx)
+func (e *Extractor) appendTablesMetadata(results []meta.Table, dataset *bigquery.Dataset) ([]meta.Table, error) {
+	it := dataset.Tables(e.ctx)
 
 	table, err := it.Next()
 	for err == nil {
-		tableResult, err := e.mapTable(ctx, table, client)
+		tableResult, err := e.mapTable(table)
 		if err != nil {
 			break
 		} else {
@@ -99,8 +108,8 @@ func (e *Extractor) appendTablesMetadata(ctx context.Context, results []meta.Tab
 	return results, err
 }
 
-func (e *Extractor) mapTable(ctx context.Context, t *bigquery.Table, client *bigquery.Client) (result meta.Table, err error) {
-	tableMetadata, err := client.Dataset(t.DatasetID).Table(t.TableID).Metadata(ctx)
+func (e *Extractor) mapTable(t *bigquery.Table) (result meta.Table, err error) {
+	tableMetadata, err := e.client.Dataset(t.DatasetID).Table(t.TableID).Metadata(e.ctx)
 	result = meta.Table{
 		Urn:         fmt.Sprintf("%s.%s.%s", t.ProjectID, t.DatasetID, t.TableID),
 		Name:        t.TableID,
@@ -122,21 +131,78 @@ func (e *Extractor) extractSchema(t []*bigquery.FieldSchema) (columns *facets.Co
 }
 
 func (e *Extractor) mapColumn(t *bigquery.FieldSchema) *facets.Column {
+	columnProfile, _ := e.findColumnProfile(t)
 	return &facets.Column{
 		Name:        t.Name,
 		Description: t.Description,
 		DataType:    string(t.Type),
 		IsNullable:  !(t.Required || t.Repeated),
+		Profile:     columnProfile,
 	}
 }
 
-func (e *Extractor) createClient(ctx context.Context, config Config) (*bigquery.Client, error) {
-	if config.ServiceAccountJSON == "" {
-		e.logger.Info("credentials are not specified, creating bigquery client using Default Credentials...")
-		return bigquery.NewClient(ctx, config.ProjectID)
+func (e *Extractor) findColumnProfile(t *bigquery.FieldSchema) (*facets.ColumnProfile, error) {
+	rows, err := e.profileTheColumn()
+	if err != nil {
+		return nil, err
+	}
+	result, err := e.getResult(rows)
+
+	return &facets.ColumnProfile{
+		Min:    result.Min,
+		Max:    result.Max,
+		Avg:    result.Avg,
+		Med:    result.Med,
+		Unique: result.Unique,
+		Count:  result.Count,
+		Top:    result.Top,
+	}, err
+}
+
+func (e *Extractor) profileTheColumn() (*bigquery.RowIterator, error) {
+
+	query := e.client.Query(
+		`select 
+		"1" AS min,
+		"1" AS max,
+		1.0 AS avg,
+		1.0 AS med,
+		1 AS unique,
+		1 AS count,
+		"1" AS top`)
+	return query.Read(e.ctx)
+}
+
+type ResultRow struct {
+	Min    string  `bigquery:"min"`
+	Max    string  `bigquery:"max"`
+	Avg    float32 `bigquery:"avg"`
+	Med    float32 `bigquery:"med"`
+	Unique int64   `bigquery:"unique"`
+	Count  int64   `bigquery:"count"`
+	Top    string  `bigquery:"top"`
+}
+
+func (e *Extractor) getResult(iter *bigquery.RowIterator) (ResultRow, error) {
+	var row ResultRow
+	err := iter.Next(&row)
+	if err == iterator.Done {
+		return row, nil
+	}
+	if err != nil {
+		return row, fmt.Errorf("error iterating through results: %v", err)
 	}
 
-	return bigquery.NewClient(ctx, config.ProjectID, option.WithCredentialsJSON([]byte(config.ServiceAccountJSON)))
+	return row, err
+}
+
+func (e *Extractor) createClient(config Config) (*bigquery.Client, error) {
+	if config.ServiceAccountJSON == "" {
+		e.logger.Info("credentials are not specified, creating bigquery client using Default Credentials...")
+		return bigquery.NewClient(e.ctx, config.ProjectID)
+	}
+
+	return bigquery.NewClient(e.ctx, config.ProjectID, option.WithCredentialsJSON([]byte(config.ServiceAccountJSON)))
 }
 
 func (e *Extractor) getConfig(configMap map[string]interface{}) (config Config, err error) {
