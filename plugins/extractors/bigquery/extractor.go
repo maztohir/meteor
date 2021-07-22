@@ -10,6 +10,7 @@ import (
 	"github.com/odpf/meteor/core/extractor"
 	"github.com/odpf/meteor/plugins"
 	"github.com/odpf/meteor/proto/odpf/meta"
+	"github.com/odpf/meteor/proto/odpf/meta/facets"
 	"github.com/odpf/meteor/utils"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -60,12 +61,14 @@ func (e *Extractor) getMetadata(ctx context.Context, client *bigquery.Client) (r
 
 	dataset, err := it.Next()
 	for err == nil {
-		results, err = e.appendTablesMetadata(ctx, results, dataset)
+		results, err = e.appendTablesMetadata(ctx, results, dataset, client)
 		if err != nil {
 			return
 		}
 
 		dataset, err = it.Next()
+
+		break
 	}
 	if err == iterator.Done {
 		err = nil
@@ -74,13 +77,20 @@ func (e *Extractor) getMetadata(ctx context.Context, client *bigquery.Client) (r
 	return
 }
 
-func (e *Extractor) appendTablesMetadata(ctx context.Context, results []meta.Table, dataset *bigquery.Dataset) ([]meta.Table, error) {
+func (e *Extractor) appendTablesMetadata(ctx context.Context, results []meta.Table, dataset *bigquery.Dataset, client *bigquery.Client) ([]meta.Table, error) {
 	it := dataset.Tables(ctx)
 
 	table, err := it.Next()
 	for err == nil {
-		results = append(results, e.mapTable(table))
+		tableResult, err := e.mapTable(ctx, table, client)
+		if err != nil {
+			break
+		} else {
+			results = append(results, tableResult)
+		}
 		table, err = it.Next()
+
+		break
 	}
 	if err == iterator.Done {
 		err = nil
@@ -89,12 +99,34 @@ func (e *Extractor) appendTablesMetadata(ctx context.Context, results []meta.Tab
 	return results, err
 }
 
-func (e *Extractor) mapTable(t *bigquery.Table) meta.Table {
-	return meta.Table{
+func (e *Extractor) mapTable(ctx context.Context, t *bigquery.Table, client *bigquery.Client) (result meta.Table, err error) {
+	tableMetadata, err := client.Dataset(t.DatasetID).Table(t.TableID).Metadata(ctx)
+	result = meta.Table{
 		Urn:         fmt.Sprintf("%s.%s.%s", t.ProjectID, t.DatasetID, t.TableID),
 		Name:        t.TableID,
 		Source:      "bigquery",
 		Description: t.DatasetID,
+		Schema:      e.extractSchema(tableMetadata.Schema),
+	}
+	return result, err
+}
+
+func (e *Extractor) extractSchema(t []*bigquery.FieldSchema) (columns *facets.Columns) {
+	var columnList []*facets.Column
+	for _, b := range t {
+		columnList = append(columnList, e.mapColumn(b))
+	}
+	return &facets.Columns{
+		Columns: columnList,
+	}
+}
+
+func (e *Extractor) mapColumn(t *bigquery.FieldSchema) *facets.Column {
+	return &facets.Column{
+		Name:        t.Name,
+		Description: t.Description,
+		DataType:    string(t.Type),
+		IsNullable:  !(t.Required || t.Repeated),
 	}
 }
 
