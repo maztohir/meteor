@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
+	"text/template"
 
 	"cloud.google.com/go/bigquery"
 	"github.com/mitchellh/mapstructure"
@@ -19,6 +24,7 @@ import (
 type Config struct {
 	ProjectID          string `mapstructure:"project_id" validate:"required"`
 	ServiceAccountJSON string `mapstructure:"service_account_json"`
+	TablePattern       string `mapstructure:"table_pattern"`
 }
 
 type Extractor struct {
@@ -36,7 +42,7 @@ func New(logger plugins.Logger, client *bigquery.Client, ctx context.Context) ex
 }
 
 func (e *Extractor) Extract(configMap map[string]interface{}) (result []meta.Table, err error) {
-	e.logger.Info("extracting kafka metadata...")
+	e.logger.Info("extracting bigquery metadata...")
 	var config Config
 	err = utils.BuildConfig(configMap, &config)
 	if err != nil {
@@ -47,17 +53,17 @@ func (e *Extractor) Extract(configMap map[string]interface{}) (result []meta.Tab
 		return
 	}
 
-	if e.ctx != nil {
+	if e.ctx == nil {
 		e.ctx = context.Background()
 	}
 
-	if e.client != nil {
+	if e.client == nil {
 		e.client, err = e.createClient(config)
 		if err != nil {
 			return
 		}
 	}
-	result, err = e.getMetadata()
+	result, err = e.getMetadata(config)
 	if err != nil {
 		return
 	}
@@ -65,19 +71,17 @@ func (e *Extractor) Extract(configMap map[string]interface{}) (result []meta.Tab
 	return
 }
 
-func (e *Extractor) getMetadata() (results []meta.Table, err error) {
+func (e *Extractor) getMetadata(config Config) (results []meta.Table, err error) {
 	it := e.client.Datasets(e.ctx)
 
 	dataset, err := it.Next()
 	for err == nil {
-		results, err = e.appendTablesMetadata(results, dataset)
+		results, err = e.appendTablesMetadata(results, dataset, config)
 		if err != nil {
 			return
 		}
 
 		dataset, err = it.Next()
-
-		break
 	}
 	if err == iterator.Done {
 		err = nil
@@ -86,20 +90,22 @@ func (e *Extractor) getMetadata() (results []meta.Table, err error) {
 	return
 }
 
-func (e *Extractor) appendTablesMetadata(results []meta.Table, dataset *bigquery.Dataset) ([]meta.Table, error) {
+func (e *Extractor) appendTablesMetadata(results []meta.Table, dataset *bigquery.Dataset, config Config) ([]meta.Table, error) {
 	it := dataset.Tables(e.ctx)
 
 	table, err := it.Next()
 	for err == nil {
-		tableResult, err := e.mapTable(table)
-		if err != nil {
-			break
-		} else {
-			results = append(results, tableResult)
+		if config.TablePattern != "" {
+			fullTableID := fmt.Sprintf("%s.%s", table.DatasetID, table.TableID)
+			res, _ := regexp.MatchString(config.TablePattern, fullTableID)
+			if res {
+				tableResult, err := e.mapTable(table)
+				if err == nil {
+					results = append(results, tableResult)
+				}
+			}
 		}
 		table, err = it.Next()
-
-		break
 	}
 	if err == iterator.Done {
 		err = nil
@@ -115,38 +121,48 @@ func (e *Extractor) mapTable(t *bigquery.Table) (result meta.Table, err error) {
 		Name:        t.TableID,
 		Source:      "bigquery",
 		Description: t.DatasetID,
-		Schema:      e.extractSchema(tableMetadata.Schema),
+		Schema:      e.extractSchema(tableMetadata.Schema, tableMetadata),
 	}
 	return result, err
 }
 
-func (e *Extractor) extractSchema(t []*bigquery.FieldSchema) (columns *facets.Columns) {
+func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.TableMetadata) (columns *facets.Columns) {
 	var columnList []*facets.Column
-	for _, b := range t {
-		columnList = append(columnList, e.mapColumn(b))
+	var wg sync.WaitGroup
+	wg.Add(len(col))
+	for _, b := range col {
+		go func(s *bigquery.FieldSchema) {
+			defer wg.Done()
+			columnList = append(columnList, e.mapColumn(s, t))
+		}(b)
 	}
+	wg.Wait()
 	return &facets.Columns{
 		Columns: columnList,
 	}
 }
 
-func (e *Extractor) mapColumn(t *bigquery.FieldSchema) *facets.Column {
-	columnProfile, _ := e.findColumnProfile(t)
+func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata) *facets.Column {
+	columnProfile, err := e.findColumnProfile(col, t)
+	fmt.Println(err)
+	fmt.Println(columnProfile)
 	return &facets.Column{
-		Name:        t.Name,
-		Description: t.Description,
-		DataType:    string(t.Type),
-		IsNullable:  !(t.Required || t.Repeated),
+		Name:        col.Name,
+		Description: col.Description,
+		DataType:    string(col.Type),
+		IsNullable:  !(col.Required || col.Repeated),
 		Profile:     columnProfile,
 	}
 }
 
-func (e *Extractor) findColumnProfile(t *bigquery.FieldSchema) (*facets.ColumnProfile, error) {
-	rows, err := e.profileTheColumn()
+func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata) (*facets.ColumnProfile, error) {
+	rows, err := e.profileTheColumn(col, t)
 	if err != nil {
+		fmt.Println(err)
 		return nil, err
 	}
 	result, err := e.getResult(rows)
+	fmt.Println(result)
 
 	return &facets.ColumnProfile{
 		Min:    result.Min,
@@ -159,17 +175,33 @@ func (e *Extractor) findColumnProfile(t *bigquery.FieldSchema) (*facets.ColumnPr
 	}, err
 }
 
-func (e *Extractor) profileTheColumn() (*bigquery.RowIterator, error) {
+func (e *Extractor) profileTheColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata) (*bigquery.RowIterator, error) {
+	queryTemplate := `SELECT
+		COALESCE(CAST(MIN({{ .ColumnName }}) AS STRING), "") AS min,
+		COALESCE(CAST(MAX({{ .ColumnName }}) AS STRING), "") AS max,
+		COALESCE(AVG(SAFE_CAST(SAFE_CAST({{ .ColumnName }} AS STRING) AS FLOAT64)), 0.0) AS avg,
+		COALESCE(SAFE_CAST(CAST(APPROX_QUANTILES({{ .ColumnName }}, 2)[OFFSET(1)] AS STRING) AS FLOAT64), 0.0) AS med,
+		COALESCE(APPROX_COUNT_DISTINCT({{ .ColumnName }}),0) AS unique,
+		COALESCE(COUNT({{ .ColumnName }}), 0) AS count,
+		COALESCE(CAST(APPROX_TOP_COUNT({{ .ColumnName }}, 1)[OFFSET(0)].value AS STRING), "") AS top
+	FROM
+		{{ .TableName }}
+	WHERE
+		DATE({{ .Partition }}) >= DATE_SUB(CURRENT_DATE, INTERVAL 3 DAY)`
+	data := map[string]interface{}{
+		"ColumnName": col.Name,
+		"TableName":  strings.ReplaceAll(t.FullID, ":", "."),
+		"Partition":  t.TimePartitioning.Field,
+	}
 
-	query := e.client.Query(
-		`select 
-		"1" AS min,
-		"1" AS max,
-		1.0 AS avg,
-		1.0 AS med,
-		1 AS unique,
-		1 AS count,
-		"1" AS top`)
+	temp := template.Must(template.New("query").Parse(queryTemplate))
+	builder := &strings.Builder{}
+	if err := temp.Execute(builder, data); err != nil {
+		panic(err)
+	}
+	finalQuery := builder.String()
+	fmt.Println(finalQuery)
+	query := e.client.Query(finalQuery)
 	return query.Read(e.ctx)
 }
 
