@@ -129,11 +129,15 @@ func (e *Extractor) mapTable(t *bigquery.Table) (result meta.Table, err error) {
 func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.TableMetadata) (columns *facets.Columns) {
 	var columnList []*facets.Column
 	var wg sync.WaitGroup
+	var mu sync.Mutex
 	wg.Add(len(col))
 	for _, b := range col {
 		go func(s *bigquery.FieldSchema) {
 			defer wg.Done()
-			columnList = append(columnList, e.mapColumn(s, t))
+			column := e.mapColumn(s, t)
+			mu.Lock()
+			columnList = append(columnList, column)
+			mu.Unlock()
 		}(b)
 	}
 	wg.Wait()
@@ -143,9 +147,7 @@ func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.Table
 }
 
 func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata) *facets.Column {
-	columnProfile, err := e.findColumnProfile(col, t)
-	fmt.Println(err)
-	fmt.Println(columnProfile)
+	columnProfile, _ := e.findColumnProfile(col, t)
 	return &facets.Column{
 		Name:        col.Name,
 		Description: col.Description,
@@ -156,13 +158,16 @@ func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetada
 }
 
 func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata) (*facets.ColumnProfile, error) {
+	if col.Type == bigquery.BytesFieldType || col.Repeated || col.Type == bigquery.RecordFieldType {
+		e.logger.Info("Skipping " + col.Name + " column")
+		return nil, nil
+	}
 	rows, err := e.profileTheColumn(col, t)
 	if err != nil {
-		fmt.Println(err)
+		e.logger.Error(err)
 		return nil, err
 	}
 	result, err := e.getResult(rows)
-	fmt.Println(result)
 
 	return &facets.ColumnProfile{
 		Min:    result.Min,
@@ -200,7 +205,6 @@ func (e *Extractor) profileTheColumn(col *bigquery.FieldSchema, t *bigquery.Tabl
 		panic(err)
 	}
 	finalQuery := builder.String()
-	fmt.Println(finalQuery)
 	query := e.client.Query(finalQuery)
 	return query.Read(e.ctx)
 }
