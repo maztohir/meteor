@@ -150,7 +150,7 @@ func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.Table
 func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata, profileColumn bool) *facets.Column {
 	var columnProfile *facets.ColumnProfile
 	if profileColumn {
-		columnProfile, _ = e.findColumnProfile(col, t, profileColumn)
+		columnProfile, _ = e.findColumnProfile(col, t)
 	}
 	return &facets.Column{
 		Name:        col.Name,
@@ -161,7 +161,7 @@ func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetada
 	}
 }
 
-func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata, profileColumn bool) (*facets.ColumnProfile, error) {
+func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata) (*facets.ColumnProfile, error) {
 	if col.Type == bigquery.BytesFieldType || col.Repeated || col.Type == bigquery.RecordFieldType {
 		e.logger.Info("Skip profiling " + col.Name + " column")
 		return nil, nil
