@@ -25,6 +25,7 @@ type Config struct {
 	ProjectID          string `mapstructure:"project_id" validate:"required"`
 	ServiceAccountJSON string `mapstructure:"service_account_json"`
 	TablePattern       string `mapstructure:"table_pattern"`
+	ProfileColumn      bool   `mapstructure:"profile_column"`
 }
 
 type Extractor struct {
@@ -99,7 +100,7 @@ func (e *Extractor) appendTablesMetadata(results []meta.Table, dataset *bigquery
 			fullTableID := fmt.Sprintf("%s.%s", table.DatasetID, table.TableID)
 			res, _ := regexp.MatchString(config.TablePattern, fullTableID)
 			if res {
-				tableResult, err := e.mapTable(table)
+				tableResult, err := e.mapTable(table, config.ProfileColumn)
 				if err == nil {
 					results = append(results, tableResult)
 				}
@@ -114,26 +115,30 @@ func (e *Extractor) appendTablesMetadata(results []meta.Table, dataset *bigquery
 	return results, err
 }
 
-func (e *Extractor) mapTable(t *bigquery.Table) (result meta.Table, err error) {
+func (e *Extractor) mapTable(t *bigquery.Table, profileColumn bool) (result meta.Table, err error) {
 	tableMetadata, err := e.client.Dataset(t.DatasetID).Table(t.TableID).Metadata(e.ctx)
 	result = meta.Table{
 		Urn:         fmt.Sprintf("%s.%s.%s", t.ProjectID, t.DatasetID, t.TableID),
 		Name:        t.TableID,
 		Source:      "bigquery",
 		Description: t.DatasetID,
-		Schema:      e.extractSchema(tableMetadata.Schema, tableMetadata),
+		Schema:      e.extractSchema(tableMetadata.Schema, tableMetadata, profileColumn),
 	}
 	return result, err
 }
 
-func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.TableMetadata) (columns *facets.Columns) {
+func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.TableMetadata, profileColumn bool) (columns *facets.Columns) {
 	var columnList []*facets.Column
 	var wg sync.WaitGroup
+	var mu sync.Mutex
 	wg.Add(len(col))
 	for _, b := range col {
 		go func(s *bigquery.FieldSchema) {
 			defer wg.Done()
-			columnList = append(columnList, e.mapColumn(s, t))
+			column := e.mapColumn(s, t, profileColumn)
+			mu.Lock()
+			columnList = append(columnList, column)
+			mu.Unlock()
 		}(b)
 	}
 	wg.Wait()
@@ -142,10 +147,11 @@ func (e *Extractor) extractSchema(col []*bigquery.FieldSchema, t *bigquery.Table
 	}
 }
 
-func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata) *facets.Column {
-	columnProfile, err := e.findColumnProfile(col, t)
-	fmt.Println(err)
-	fmt.Println(columnProfile)
+func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetadata, profileColumn bool) *facets.Column {
+	var columnProfile *facets.ColumnProfile
+	if profileColumn {
+		columnProfile, _ = e.findColumnProfile(col, t, profileColumn)
+	}
 	return &facets.Column{
 		Name:        col.Name,
 		Description: col.Description,
@@ -155,14 +161,17 @@ func (e *Extractor) mapColumn(col *bigquery.FieldSchema, t *bigquery.TableMetada
 	}
 }
 
-func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata) (*facets.ColumnProfile, error) {
+func (e *Extractor) findColumnProfile(col *bigquery.FieldSchema, t *bigquery.TableMetadata, profileColumn bool) (*facets.ColumnProfile, error) {
+	if col.Type == bigquery.BytesFieldType || col.Repeated || col.Type == bigquery.RecordFieldType {
+		e.logger.Info("Skip profiling " + col.Name + " column")
+		return nil, nil
+	}
 	rows, err := e.profileTheColumn(col, t)
 	if err != nil {
-		fmt.Println(err)
+		e.logger.Error(err)
 		return nil, err
 	}
 	result, err := e.getResult(rows)
-	fmt.Println(result)
 
 	return &facets.ColumnProfile{
 		Min:    result.Min,
@@ -185,13 +194,10 @@ func (e *Extractor) profileTheColumn(col *bigquery.FieldSchema, t *bigquery.Tabl
 		COALESCE(COUNT({{ .ColumnName }}), 0) AS count,
 		COALESCE(CAST(APPROX_TOP_COUNT({{ .ColumnName }}, 1)[OFFSET(0)].value AS STRING), "") AS top
 	FROM
-		{{ .TableName }}
-	WHERE
-		DATE({{ .Partition }}) >= DATE_SUB(CURRENT_DATE, INTERVAL 3 DAY)`
+		{{ .TableName }}`
 	data := map[string]interface{}{
 		"ColumnName": col.Name,
 		"TableName":  strings.ReplaceAll(t.FullID, ":", "."),
-		"Partition":  t.TimePartitioning.Field,
 	}
 
 	temp := template.Must(template.New("query").Parse(queryTemplate))
@@ -200,7 +206,6 @@ func (e *Extractor) profileTheColumn(col *bigquery.FieldSchema, t *bigquery.Tabl
 		panic(err)
 	}
 	finalQuery := builder.String()
-	fmt.Println(finalQuery)
 	query := e.client.Query(finalQuery)
 	return query.Read(e.ctx)
 }
